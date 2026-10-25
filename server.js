@@ -4,10 +4,8 @@ import crypto from 'crypto';
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 
-// In-memory store for the grader's testing window
 const store = new Map();
 
-// Helper: Generate deterministic/random lowercase hex
 const genHex = (bytes) => crypto.randomBytes(bytes).toString('hex');
 const hash = (str) => crypto.createHash('sha256').update(str).digest('hex');
 const sortKeys = (obj) => {
@@ -19,7 +17,6 @@ const sortKeys = (obj) => {
     }, {});
 };
 
-// Helper: Call Gemini API for root cause analysis
 async function analyzeIncident(incident, toolCatalog, policy) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -87,32 +84,27 @@ Choose exactly ONE effect tool from the allowed effects to resolve the incident.
     return JSON.parse(data.candidates[0].content.parts[0].text);
 }
 
-// Ensure replay idempotency & conflict handling
 function checkConflict(storedRequest, incomingRequest) {
     const storedHash = hash(JSON.stringify(sortKeys(storedRequest)));
     const incomingHash = hash(JSON.stringify(sortKeys(incomingRequest)));
     return storedHash !== incomingHash;
 }
 
-// --- Endpoint: Initialize Run ---
 app.post('/v2/incidents', async (req, res) => {
     const { runId, profile, publicMarker, incident, toolCatalog, policy } = req.body;
     if (profile !== 'ga5-incident-agent/v2') return res.status(400).json({ error: "Unsupported profile" });
 
-    // Handle replay / conflict
     if (store.has(runId)) {
         const state = store.get(runId);
         if (checkConflict(state.originalRequest, req.body)) return res.status(409).json({ error: "Conflict" });
         return res.json(buildResponse(state));
     }
 
-    // Parse Trace Context
     const traceparentHeader = req.headers['traceparent'] || '';
     const tpMatch = traceparentHeader.match(/^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/);
     const traceId = tpMatch ? tpMatch[1] : genHex(16);
     const incomingParentSpanId = tpMatch ? tpMatch[2] : null;
 
-    // Secure base state (Drop sensitive fields entirely)
     const safeRequest = { ...req.body };
     delete safeRequest.sensitive;
     delete safeRequest.incident.transcript;
@@ -138,7 +130,6 @@ app.post('/v2/incidents', async (req, res) => {
         state.diagnosis = { rootCause: plan.rootCause, evidence: plan.evidence };
         state.plannedEffect = plan.effect;
 
-        // Generate Diagnostics Dispatches
         for (const diag of plan.diagnostics) {
             const actionId = genHex(12);
             const dispatch = {
@@ -159,7 +150,6 @@ app.post('/v2/incidents', async (req, res) => {
     }
 });
 
-// --- Endpoint: Process Receipts ---
 app.post('/v2/incidents/:runId/receipts', (req, res) => {
     const { runId } = req.params;
     const state = store.get(runId);
@@ -168,7 +158,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
     const { receiptId, outcomes, approvals } = req.body;
     const existingReceipt = state.receiptLog.find(r => r.receiptId === receiptId);
     
-    // Check for replay vs conflict
     if (existingReceipt) {
         if (!state.receiptBodies) state.receiptBodies = {};
         if (checkConflict(state.receiptBodies[receiptId], req.body)) return res.status(409).json({ error: "Conflict" });
@@ -180,7 +169,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
 
     let anyTimeout = false;
 
-    // Process Tool Outcomes
     if (outcomes) {
         for (const outcome of outcomes) {
             const dispatchIndex = state.pendingDispatches.findIndex(d => d.actionId === outcome.actionId && d.attempt === outcome.attempt);
@@ -210,7 +198,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
         }
     }
 
-    // Process Approvals
     if (approvals) {
         for (const app of approvals) {
             const pendingAppIdx = state.pendingApprovals.findIndex(pa => pa.approvalId === app.approvalId);
@@ -236,7 +223,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
         }
     }
 
-    // State Transitions
     if (state.status === 'waiting' && state.pendingDispatches.length === 0 && state.pendingApprovals.length === 0) {
         if (anyTimeout) {
             state.status = 'failed';
@@ -269,14 +255,12 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
     return res.json(buildResponse(state));
 });
 
-// --- Endpoint: Get State ---
 app.get('/v2/incidents/:runId', (req, res) => {
     const state = store.get(req.params.runId);
     if (!state) return res.status(404).json({ error: "Not found" });
     return res.json(buildResponse(state));
 });
 
-// --- OTLP & Response Builder ---
 function buildResponse(state) {
     const isFinal = state.status === 'completed' || state.status === 'failed';
     const safeActionLog = state.actionLog.map(a => {
@@ -357,20 +341,20 @@ function buildTrace(state) {
                 { key: "http.request.method", value: { stringValue: "POST" } },
                 { key: "http.request.resend_count", value: { intValue: d.attempt - 1 } }
             ]);
-            let statusCode = 0; // UNSET
+            let statusCode = 0; 
 
             if (receipt) {
                 clientAttrs.push({ key: "ga5.receipt.id", value: { stringValue: receipt.receiptId } });
                 clientAttrs.push({ key: "ga5.receipt.nonce", value: { stringValue: receipt.nonce } });
                 
                 if (receipt.status === 503) {
-                    statusCode = 2; // ERROR
+                    statusCode = 2; 
                     clientAttrs.push({ key: "error.type", value: { stringValue: "503" } });
                 } else if (receipt.status === 0 && receipt.errorType === 'timeout') {
-                    statusCode = 2; // ERROR
+                    statusCode = 2; 
                     clientAttrs.push({ key: "error.type", value: { stringValue: "timeout" } });
                 } else {
-                    statusCode = 1; // OK
+                    statusCode = 1; 
                 }
             }
 
@@ -390,4 +374,10 @@ function buildTrace(state) {
         const receipt = state.receiptLog.find(r => r.approvalId === app.approvalId);
         if (receipt) appAttrs.push({ key: "ga5.approval.receipt.nonce", value: { stringValue: receipt.nonce } });
         
-        spans.push({ traceId: state.traceId, spanId: app.
+        spans.push({ traceId: state.traceId, spanId: app.spanId, parentSpanId: state.agentSpanId, name: "approval_gate", kind: 1, attributes: appAttrs });
+    }
+
+    return { resourceSpans: [{ scopeSpans: [{ spans }] }] };
+}
+
+app.listen(process.env.PORT || 3000, () => console.log('Incident Agent Active'));
