@@ -22,7 +22,10 @@ const sortKeys = (obj) => {
 // Helper: Call Gemini API for root cause analysis
 async function analyzeIncident(incident, toolCatalog, policy) {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("GEMINI_API_KEY is required");
+    if (!apiKey) {
+        console.error("ERROR: GEMINI_API_KEY is missing in Render Environment Variables!");
+        throw new Error("GEMINI_API_KEY is required");
+    }
 
     const prompt = `You are a highly precise incident response agent.
 Incident Transcript:
@@ -34,26 +37,53 @@ Policy - Max Diagnostics: ${policy.maximumDiagnostics}, Allowed Effects: ${JSON.
 
 Choose ONE root cause from the allowed list. Cite 2-4 evidence IDs (e.g. "ev_123").
 Choose 1 to ${policy.maximumDiagnostics} diagnostic tools to confirm it. Each diagnostic MUST cite at least one evidence ID. No duplicate evidence IDs across diagnostics.
-Choose exactly ONE effect tool from the allowed effects to resolve the incident.
-
-Respond ONLY with this exact JSON structure (no markdown):
-{
-  "rootCause": "chosen cause",
-  "evidence": ["ev_1", "ev_2"],
-  "diagnostics": [ { "toolName": "...", "evidence": ["ev_1"], "arguments": {...} } ],
-  "effect": { "toolName": "...", "arguments": {...} }
-}`;
+Choose exactly ONE effect tool from the allowed effects to resolve the incident.`;
 
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { response_mime_type: "application/json" }
+            generationConfig: { 
+                response_mime_type: "application/json",
+                response_schema: {
+                    type: "OBJECT",
+                    properties: {
+                        rootCause: { type: "STRING" },
+                        evidence: { type: "ARRAY", items: { type: "STRING" } },
+                        diagnostics: {
+                            type: "ARRAY",
+                            items: {
+                                type: "OBJECT",
+                                properties: {
+                                    toolName: { type: "STRING" },
+                                    evidence: { type: "ARRAY", items: { type: "STRING" } },
+                                    arguments: { type: "OBJECT" }
+                                },
+                                required: ["toolName", "evidence", "arguments"]
+                            }
+                        },
+                        effect: {
+                            type: "OBJECT",
+                            properties: {
+                                toolName: { type: "STRING" },
+                                arguments: { type: "OBJECT" }
+                            },
+                            required: ["toolName", "arguments"]
+                        }
+                    },
+                    required: ["rootCause", "evidence", "diagnostics", "effect"]
+                }
+            }
         })
     });
 
     const data = await res.json();
+    if (!data.candidates || data.candidates.length === 0) {
+        console.error("Gemini API Error Payload:", JSON.stringify(data, null, 2));
+        throw new Error("Gemini returned an error instead of valid response");
+    }
+
     return JSON.parse(data.candidates[0].content.parts[0].text);
 }
 
@@ -113,7 +143,7 @@ app.post('/v2/incidents', async (req, res) => {
             const actionId = genHex(12);
             const dispatch = {
                 actionId, callId: actionId, phase: 'diagnostic', toolName: diag.toolName,
-                arguments: diag.arguments, evidence: diag.evidence, attempt: 1,
+                arguments: diag.arguments || {}, evidence: diag.evidence || [], attempt: 1,
                 executeSpanId: genHex(8), clientSpanId: genHex(8)
             };
             dispatch.traceparent = `00-${traceId}-${dispatch.clientSpanId}-01`;
@@ -124,6 +154,7 @@ app.post('/v2/incidents', async (req, res) => {
         store.set(runId, state);
         return res.json(buildResponse(state));
     } catch (e) {
+        console.error(`Error in /v2/incidents for runId ${runId}:`, e);
         return res.status(500).json({ error: "Agent failure" });
     }
 });
@@ -154,7 +185,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
         for (const outcome of outcomes) {
             const dispatchIndex = state.pendingDispatches.findIndex(d => d.actionId === outcome.actionId && d.attempt === outcome.attempt);
             if (dispatchIndex === -1 && state.actionLog.some(a => a.phase === 'effect' && a.actionId === outcome.actionId)) {
-                // It's the effect's outcome
                 state.receiptLog.push({ receiptId, ...outcome });
                 state.status = 'completed';
                 state.chosenEffect = state.plannedEffect.toolName;
@@ -167,7 +197,6 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
             state.receiptLog.push({ receiptId, ...outcome });
 
             if (outcome.status === 503 && outcome.attempt === 1) {
-                // Retry logic
                 dispatch.attempt = 2;
                 dispatch.clientSpanId = genHex(8);
                 dispatch.traceparent = `00-${state.traceId}-${dispatch.clientSpanId}-01`;
@@ -214,7 +243,9 @@ app.post('/v2/incidents/:runId/receipts', (req, res) => {
             state.suppressed.push(state.plannedEffect.toolName);
         } else {
             const effTool = state.plannedEffect.toolName;
-            if (state.policy.approvalRequiredFor.includes(effTool)) {
+            const needsApproval = (state.policy.approvalRequiredFor || []).includes(effTool);
+            
+            if (needsApproval) {
                 const appReq = {
                     approvalId: genHex(12), actionId: genHex(12), spanId: genHex(8),
                     toolName: effTool, argumentsDigest: hash(JSON.stringify(sortKeys(state.plannedEffect.arguments)))
@@ -248,8 +279,6 @@ app.get('/v2/incidents/:runId', (req, res) => {
 // --- OTLP & Response Builder ---
 function buildResponse(state) {
     const isFinal = state.status === 'completed' || state.status === 'failed';
-    
-    // Filter internal properties out of actionLog
     const safeActionLog = state.actionLog.map(a => {
         const copy = { ...a };
         delete copy.executeSpanId;
@@ -324,7 +353,7 @@ function buildTrace(state) {
             const receipt = state.receiptLog.find(r => r.actionId === aId && r.attempt === d.attempt);
             const clientAttrs = attrs([
                 { key: "ga5.action.id", value: { stringValue: aId } },
-                { key: "ga5.attempt", value: { intValue: d.attempt } }, // Stored as JSON Number
+                { key: "ga5.attempt", value: { intValue: d.attempt } },
                 { key: "http.request.method", value: { stringValue: "POST" } },
                 { key: "http.request.resend_count", value: { intValue: d.attempt - 1 } }
             ]);
@@ -361,10 +390,4 @@ function buildTrace(state) {
         const receipt = state.receiptLog.find(r => r.approvalId === app.approvalId);
         if (receipt) appAttrs.push({ key: "ga5.approval.receipt.nonce", value: { stringValue: receipt.nonce } });
         
-        spans.push({ traceId: state.traceId, spanId: app.spanId, parentSpanId: state.agentSpanId, name: "approval_gate", kind: 1, attributes: appAttrs });
-    }
-
-    return { resourceSpans: [{ scopeSpans: [{ spans }] }] };
-}
-
-app.listen(process.env.PORT || 3000, () => console.log('Incident Agent Active'));
+        spans.push({ traceId: state.traceId, spanId: app.
